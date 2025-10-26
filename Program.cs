@@ -1,8 +1,16 @@
+using Microsoft.EntityFrameworkCore;
+
 using FirebaseAdmin;
 using FirebaseAdmin.Auth;
 using Google.Apis.Auth.OAuth2;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") ?? "Data Source=bankingInformation.db";
+
+builder.Services.AddDbContext<ApplicationDbContext>(options =>
+    options.UseSqlite(connectionString));
+    
 var app = builder.Build();
 
 var serviceAccountPath = "C:/Users/rdeed/Downloads/soft-serve-software-firebase-adminsdk-fbsvc-3baf649e03.json"; //TODO define path as env var
