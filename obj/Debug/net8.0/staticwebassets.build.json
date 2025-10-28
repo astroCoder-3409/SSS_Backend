@@ -1,11 +1,1 @@
-{
-  "Version": 1,
-  "Hash": "lwVwh/Vg5wGFUCFg7HC3eC1E8dlbrt/tKSUqeL8kdlw=",
-  "Source": "SSS_Backend",
-  "BasePath": "_content/SSS_Backend",
-  "Mode": "Default",
-  "ManifestType": "Build",
-  "ReferencedProjectsConfiguration": [],
-  "DiscoveryPatterns": [],
-  "Assets": []
-}
+{"Version":1,"Hash":"JOxr6w+rKGWXtjetP65MV0iW3vMcFHnd24Qtxd1ey7w=","Source":"SSS_Backend","BasePath":"_content/SSS_Backend","Mode":"Default","ManifestType":"Build","ReferencedProjectsConfiguration":[],"DiscoveryPatterns":[],"Assets":[],"Endpoints":[]}
