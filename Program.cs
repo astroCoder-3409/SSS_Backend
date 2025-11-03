@@ -3,12 +3,15 @@ using FirebaseAdmin.Auth;
 using Going.Plaid;
 using Going.Plaid.Entity;
 using Google.Apis.Auth.OAuth2;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SSS_Backend;
+using System;
 using System.Globalization;
+using System.Net.Http;
 using static Google.Apis.Requests.BatchRequest;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -49,6 +52,45 @@ FirebaseApp.Create(new AppOptions()
 app.UseCors();
 
 
+app.MapPost("/api/exchange_public_token", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    [FromBody] String publicToken,
+    [FromServices] PlaidClient plaidClient,
+    [FromServices] IOptions<PlaidCredentials> plaidCredentials) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    try
+    {
+      var response = await plaidClient.ItemPublicTokenExchangeAsync(
+           new Going.Plaid.Item.ItemPublicTokenExchangeRequest()
+                {
+                     PublicToken = publicToken
+               }
+            );
+
+        var newItem = new User
+        {
+            UserId = userId,
+            AccessToken = accessToken, // Note: Access tokens should be encrypted in a real DB
+            ItemId = itemID
+        };
+        return Results.Ok(new { PublicTokenExchange = "complete" });
+   
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error exchanging token: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while exchanging the token.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+
 // Example of protected endpoint TODO Remove this later.
 app.MapGet("/api/protected-data", (HttpContext httpContext) => {
     var userId = httpContext.Items["UserId"] as string;
@@ -64,7 +106,7 @@ app.MapGet("/api/protected-data", (HttpContext httpContext) => {
 app.MapPost("/api/create_link_token", async (
     HttpContext httpContext,
     [FromServices] PlaidClient plaidClient,
-    [FromServices] IOptions<PlaidCredentials> plaidCredentials) => // <-- CHANGED: Inject PlaidOptions
+    [FromServices] IOptions<PlaidCredentials> plaidCredentials) =>
 {
     try
     {
