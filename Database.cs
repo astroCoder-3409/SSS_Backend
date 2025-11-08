@@ -33,24 +33,25 @@ public class ApplicationDbContext : DbContext
 public class User
 {
     [Key]
-    public int UserId { get; set; }
+    public string UserId { get; set; }
 
     [Required]
     [MaxLength(100)]
     public string Email { get; set; }
 
     [Required]
-    public string PasswordHash { get; set; } // Store a HASH, not the plain password
-
-    [Required]
     [MaxLength(100)]
-    public string FullName { get; set; }
+    public string? FullName { get; set; }
 
-    public DateTime DateOfBirth { get; set; }
+    public DateTime? DateOfBirth { get; set; }
 
     // Navigation property: A User can have many Accounts
-    public ICollection<Account> Accounts { get; set; }
-}
+    public ICollection<Account>? Accounts { get; set; }
+
+    public string? PlaidAccessToken { get; set; }
+
+    public string? PlaidItemId { get; set; }
+} 
 
 public class Account
 {
@@ -71,7 +72,7 @@ public class Account
     // --- Foreign Key & Navigation Properties ---
 
     // 1. The Foreign Key property
-    public int UserId { get; set; }
+    public string UserId { get; set; }
     
     // 2. The navigation property to the "one" side of the relationship (the User)
     public User User { get; set; }

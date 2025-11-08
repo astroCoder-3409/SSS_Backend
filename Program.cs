@@ -2,6 +2,7 @@ using FirebaseAdmin;
 using FirebaseAdmin.Auth;
 using Going.Plaid;
 using Going.Plaid.Entity;
+using Going.Plaid.Item;
 using Google.Apis.Auth.OAuth2;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -12,6 +13,7 @@ using SSS_Backend;
 using System;
 using System.Globalization;
 using System.Net.Http;
+using System.Security.Cryptography;
 using static Google.Apis.Requests.BatchRequest;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -40,7 +42,7 @@ builder.Services.AddSingleton<ContextContainer>(new ContextContainer() { Running
 
 var app = builder.Build();
 
-var serviceAccountPath = "C:/Users/rdeed/Downloads/soft-serve-software-firebase-adminsdk-fbsvc-3baf649e03.json"; //TODO define path as env var
+var serviceAccountPath = builder.Configuration["Firebase:ServiceAccountPath"]; //TODO define path as env var
 
 FirebaseApp.Create(new AppOptions()
 {
@@ -55,27 +57,30 @@ app.UseCors();
 app.MapPost("/api/exchange_public_token", async (
     HttpContext httpContext,
     ApplicationDbContext db,
-    [FromBody] String publicToken,
+    [FromBody] ItemPublicTokenExchangeRequest request,
     [FromServices] PlaidClient plaidClient,
     [FromServices] IOptions<PlaidCredentials> plaidCredentials) =>
 {
     var userId = httpContext.Items["UserId"] as string;
     try
     {
-      var response = await plaidClient.ItemPublicTokenExchangeAsync(
-           new Going.Plaid.Item.ItemPublicTokenExchangeRequest()
-                {
-                     PublicToken = publicToken
-               }
-            );
+      var response = await plaidClient.ItemPublicTokenExchangeAsync(request);
 
-        var newItem = new User
+        if (response.Error is not null)
         {
-            UserId = userId,
-            AccessToken = accessToken, // Note: Access tokens should be encrypted in a real DB
-            ItemId = itemID
-        };
-        return Results.Ok(new { PublicTokenExchange = "complete" });
+            return Results.BadRequest(response.Error);
+        }
+
+        User localUser = await db.Users
+            .FirstOrDefaultAsync(u => u.UserId == userId);
+
+        localUser.PlaidAccessToken = response.AccessToken;
+        localUser.PlaidItemId = response.ItemId;
+
+        db.Users.Update(localUser);
+        await db.SaveChangesAsync();
+
+    return Results.Ok(new { PublicTokenExchange = "complete" });
    
     }
     catch (Exception ex)
@@ -84,6 +89,45 @@ app.MapPost("/api/exchange_public_token", async (
         Console.WriteLine($"[API] Error exchanging token: {ex.Message}");
         return Results.Problem(
             title: "An error occurred while exchanging the token.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+app.MapGet("/api/accounts", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    [FromServices] PlaidClient plaidClient) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    User localUser = await db.Users
+    .FirstOrDefaultAsync(u => u.UserId == userId);
+    try
+    {
+        var response = await plaidClient.AccountsGetAsync(
+             new Going.Plaid.Accounts.AccountsGetRequest()
+             {
+                 AccessToken = localUser.PlaidAccessToken
+             }
+              );
+
+
+        if (response.Error is not null)
+        {
+            return Results.BadRequest(response.Error);
+        }
+
+
+        return Results.Ok(new { response.Accounts });
+
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting the accounts.",
             detail: ex.Message,
             statusCode: 500
         );
@@ -162,6 +206,8 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
     {
         var httpContext = context.HttpContext;
         string? authHeader = httpContext.Request.Headers["Authorization"];
+        var db = httpContext.RequestServices.GetRequiredService<ApplicationDbContext>();
+
         if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
         {
             return Results.Unauthorized();
@@ -171,6 +217,34 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
         {
             FirebaseToken decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
             httpContext.Items["UserId"] = decodedToken.Uid;
+
+            string uid = decodedToken.Uid;
+
+            User localUser = await db.Users
+                .FirstOrDefaultAsync(u => u.UserId == uid);
+
+            if (localUser == null)
+            {
+                // User does not exist locally. Create them.
+                Console.WriteLine($"New user syncing. Firebase UID: {uid}");
+                localUser = new User
+                {
+                    UserId = uid,
+                    Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString(),
+                    FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString(),
+                };
+                db.Users.Add(localUser);
+            }
+            else
+            {
+                // User exists. Update their info just in case it changed.
+                Console.WriteLine($"Existing user logging in. Firebase UID: {uid}");
+                localUser.Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString();
+                localUser.FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString();
+                db.Users.Update(localUser);
+            }
+
+            await db.SaveChangesAsync();
         }
         catch (Exception ex)
         {
