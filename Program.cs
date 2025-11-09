@@ -1,5 +1,4 @@
 using Microsoft.EntityFrameworkCore;
-
 using FirebaseAdmin;
 using FirebaseAdmin.Auth;
 using Google.Apis.Auth.OAuth2;
