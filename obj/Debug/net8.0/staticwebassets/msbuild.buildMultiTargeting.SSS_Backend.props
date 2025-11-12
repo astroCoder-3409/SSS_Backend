@@ -1,3 +1,0 @@
-﻿<Project>
-  <Import Project="..\build\SSS_Backend.props" />
-</Project>
