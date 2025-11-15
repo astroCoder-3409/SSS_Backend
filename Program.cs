@@ -2,6 +2,7 @@
 using FirebaseAdmin;
 using FirebaseAdmin.Auth;
 using Going.Plaid;
+using Going.Plaid.Accounts;
 using Going.Plaid.Entity;
 using Going.Plaid.Item;
 using Google.Apis.Auth.OAuth2;
@@ -16,6 +17,7 @@ using System.Globalization;
 using System.Net.Http;
 using System.Security.Cryptography;
 using static Google.Apis.Requests.BatchRequest;
+using static SSS_Backend.DatabaseDTOs;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -40,6 +42,7 @@ builder.Services.Configure<PlaidCredentials>(builder.Configuration.GetSection(Pl
 builder.Services.Configure<PlaidOptions>(builder.Configuration.GetSection(PlaidOptions.SectionKey));
 builder.Services.AddSingleton<PlaidClient>();
 builder.Services.AddSingleton<ContextContainer>(new ContextContainer() { RunningOnServer = true });
+builder.Services.AddScoped<SyncService>();
 
 var app = builder.Build();
 
@@ -99,6 +102,7 @@ app.MapPost("/api/exchange_public_token", async (
 app.MapGet("/api/accounts", async (
     HttpContext httpContext,
     ApplicationDbContext db,
+    SyncService syncService,
     [FromServices] PlaidClient plaidClient) =>
 {
     var userId = httpContext.Items["UserId"] as string;
@@ -106,21 +110,35 @@ app.MapGet("/api/accounts", async (
     .FirstOrDefaultAsync(u => u.UserId == userId);
     try
     {
-        var response = await plaidClient.AccountsGetAsync(
+        var plaidResponse = await plaidClient.AccountsGetAsync(
              new Going.Plaid.Accounts.AccountsGetRequest()
              {
                  AccessToken = localUser.PlaidAccessToken
              }
               );
 
+        await syncService.SyncAccountsAsync(userId, plaidResponse);
 
-        if (response.Error is not null)
+        var accounts = await db.Accounts
+                .Where(a => a.UserId == userId)
+                .Select(a => new AccountDto // <-- Projecting into the DTO
+                {
+                    AccountId = a.AccountId,
+                    AccountType = a.AccountType,
+                    AccountName = a.AccountName,
+                    CurrentBalance = a.CurrentBalance,
+                    PlaidMask = a.PlaidMask
+                })
+                .ToListAsync();
+
+
+        if (plaidResponse.Error is not null)
         {
-            return Results.BadRequest(response.Error);
+            return Results.BadRequest(plaidResponse.Error);
         }
 
 
-        return Results.Ok(new { response.Accounts });
+        return Results.Ok(new { accounts });
 
     }
     catch (Exception ex)
@@ -176,7 +194,7 @@ app.MapPost("/api/create_link_token", async (
             {
                 AccessToken = null,
                 User = new LinkTokenCreateRequestUser { ClientUserId = userId, },
-                ClientName = "Quickstart for .NET",
+                ClientName = "Quickstart for .NET", //TODO
                 Products = products,
                 Language = Language.English,
                 CountryCodes = countryCodes,
@@ -197,6 +215,8 @@ app.MapPost("/api/create_link_token", async (
 
 })
 .AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+
 
 
 app.Run();
@@ -256,3 +276,104 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
         return await next(context);
     }
 }
+
+public class SyncService
+{
+    private readonly ApplicationDbContext _dbContext;
+
+    public SyncService(ApplicationDbContext dbContext)
+    {
+        _dbContext = dbContext;
+    }
+
+    public async Task<string> SyncAccountsAsync(string userId, AccountsGetResponse plaidData)
+    {
+        // 1. Validate the Plaid response
+        if (plaidData == null || plaidData.Accounts == null)
+        {
+            return "Error: Invalid Plaid response data.";
+        }
+
+        var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserId == userId);
+        if (user == null)
+        {
+            // This shouldn't happen if the userId is valid, but it's a good safety check.
+            return "Error: User not found.";
+        }
+
+        // 2. Get all Plaid account IDs from the API response
+        var plaidAccountIdsFromApi = plaidData.Accounts
+            .Select(a => a.AccountId)
+            .ToHashSet();
+
+        // 3. Get all existing accounts from our database for this user
+        var existingDbAccounts = await _dbContext.Accounts
+            .Where(a => a.UserId == userId)
+            .ToListAsync();
+
+        // 4. Create a lookup map for fast access
+        var dbAccountMap = existingDbAccounts.ToDictionary(a => a.PlaidAccountId);
+
+        int addedCount = 0;
+        int updatedCount = 0;
+
+        // 5. Loop through all accounts from the Plaid response
+        // This handles (U)pdates and (C)reates
+        // We are now looping over Going.Plaid.Entity.Account objects
+        foreach (var plaidAccount in plaidData.Accounts)
+        {
+            if (dbAccountMap.TryGetValue(plaidAccount.AccountId, out var dbAccount))
+            {
+                // --- UPDATE ---
+                dbAccount.CurrentBalance = plaidAccount.Balances.Current ?? 0;
+                dbAccount.AccountName = plaidAccount.Name;
+                dbAccount.OfficialName = plaidAccount.OfficialName;
+                dbAccount.AccountType = plaidAccount.Type.ToString();
+                dbAccount.PlaidMask = plaidAccount.Mask;
+
+                _dbContext.Accounts.Update(dbAccount);
+                updatedCount++;
+            }
+            else
+            {
+                // --- CREATE ---
+                var newAccount = new Account
+                {
+                    PlaidAccountId = plaidAccount.AccountId,
+                    UserId = userId,
+                    CurrentBalance = plaidAccount.Balances.Current ?? 0,
+                    AccountName = plaidAccount.Name,
+                    OfficialName = plaidAccount.OfficialName,
+                    AccountType = plaidAccount.Type.ToString(),
+                    PlaidMask = plaidAccount.Mask
+                };
+
+                await _dbContext.Accounts.AddAsync(newAccount);
+                addedCount++;
+            }
+        }
+
+        // 6. Handle deletes
+        // Find any accounts in our DB that are *no longer* in the Plaid response
+        var accountsToDelete = existingDbAccounts
+            .Where(a => !plaidAccountIdsFromApi.Contains(a.PlaidAccountId))
+            .ToList();
+
+        int deletedCount = 0;
+        if (accountsToDelete.Any())
+            _dbContext.Accounts.RemoveRange(accountsToDelete);
+        deletedCount = accountsToDelete.Count;
+
+        // --- NEW: 7. Update the user's last sync time ---
+        // We use UtcNow for server-side timestamps to avoid timezone issues.
+        user.LastSyncTime = DateTime.UtcNow;
+        _dbContext.Users.Update(user);
+
+        // 8. Save all changes to the database
+        await _dbContext.SaveChangesAsync();
+
+        return $"Sync complete. Added: {addedCount}, Updated: {updatedCount}, Removed: {deletedCount}.";
+    }
+}
+
+

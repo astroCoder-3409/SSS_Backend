@@ -45,6 +45,8 @@ public class User
 
     public DateTime? DateOfBirth { get; set; }
 
+    public DateTime? LastSyncTime { get; set; }
+
     // Plaid access token - nullable since not all users may have connected Plaid
     [MaxLength(500)]
     public string? PlaidAccessToken { get; set; }
@@ -61,11 +63,20 @@ public class Account
     public int AccountId { get; set; } // Renamed from "Account number" for convention
 
     [Required]
+    [MaxLength(100)]
+    public string PlaidAccountId { get; set; }
+    
+    [Required]
     [MaxLength(50)]
     public string AccountType { get; set; }
 
     [MaxLength(100)]
     public string AccountName { get; set; }
+
+    public string PlaidMask { get; set; }
+    
+    [MaxLength(255)]
+    public string OfficialName { get; set; }
 
     [Required]
     [Column(TypeName = "decimal(18, 2)")] // Specifies the exact data type in the DB
