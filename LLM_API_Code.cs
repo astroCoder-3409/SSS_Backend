@@ -40,7 +40,7 @@ public class PythonAiService
     /// <param name="userQuery">The user's question (e.g., "How can I save money?")</param>
     /// <param name="userId">The ID of the user asking the question.</param>
     /// <returns>The AI's string response.</returns>
-    public async Task<string> GetFinancialAdvice(string userQuery, int userId)
+    public async Task<string> GetFinancialAdvice(string userQuery, string userId)
     {
         // 1. === GATHER DATA FROM SQLITE (using EF Core) ===
         // We get all transactions for the specified user from the last 90 days.
