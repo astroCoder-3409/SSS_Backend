@@ -49,3 +49,8 @@ ehthumbs_vista.db
 
 # Visual Studio Code
 .vscode/
+
+# Ignore SQLite databases
+*.db
+*.db-shm
+*.db-wal

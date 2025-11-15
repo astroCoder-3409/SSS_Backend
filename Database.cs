@@ -45,10 +45,12 @@ public class User
 
     public DateTime? DateOfBirth { get; set; }
 
+    // Plaid access token - nullable since not all users may have connected Plaid
+    [MaxLength(500)]
+    public string? PlaidAccessToken { get; set; }
+
     // Navigation property: A User can have many Accounts
     public ICollection<Account>? Accounts { get; set; }
-
-    public string? PlaidAccessToken { get; set; }
 
     public string? PlaidItemId { get; set; }
 } 
