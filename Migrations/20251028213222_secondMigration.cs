@@ -10,12 +10,14 @@ namespace SSS_Backend.Migrations
         /// <inheritdoc />
         protected override void Up(MigrationBuilder migrationBuilder)
         {
+            /*
             migrationBuilder.AddColumn<string>(
                 name: "PlaidAccessToken",
                 table: "Users",
                 type: "TEXT",
                 maxLength: 500,
                 nullable: true);
+            */
         }
 
         /// <inheritdoc />
