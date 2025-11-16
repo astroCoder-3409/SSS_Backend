@@ -106,22 +106,11 @@ app.MapGet("/api/accounts", async (
     [FromServices] PlaidClient plaidClient) =>
 {
     var userId = httpContext.Items["UserId"] as string;
-    User localUser = await db.Users
-    .FirstOrDefaultAsync(u => u.UserId == userId);
     try
     {
-        var plaidResponse = await plaidClient.AccountsGetAsync(
-             new Going.Plaid.Accounts.AccountsGetRequest()
-             {
-                 AccessToken = localUser.PlaidAccessToken
-             }
-              );
-
-        await syncService.SyncAccountsAsync(userId, plaidResponse);
-
         var accounts = await db.Accounts
                 .Where(a => a.UserId == userId)
-                .Select(a => new AccountDto // <-- Projecting into the DTO
+                .Select(a => new AccountDto
                 {
                     AccountId = a.AccountId,
                     AccountType = a.AccountType,
@@ -131,14 +120,51 @@ app.MapGet("/api/accounts", async (
                 })
                 .ToListAsync();
 
-
-        if (plaidResponse.Error is not null)
+        if (accounts is not null)
         {
-            return Results.BadRequest(plaidResponse.Error);
+            return Results.BadRequest("No accounts given user");
         }
 
 
         return Results.Ok(new { accounts });
+
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting the accounts.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+app.MapGet("/api/sync", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    SyncService syncService,
+    [FromServices] PlaidClient plaidClient) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    User localUser = await db.Users
+    .FirstOrDefaultAsync(u => u.UserId == userId);
+    try
+    {
+        var success = await syncService.SyncAllAsync(userId);
+        if (!success)
+        {
+            Console.WriteLine($"[API] Error syncing user data.");
+            return Results.Problem(
+                title: "An error occurred while getting the accounts.",
+                detail: "Unknown reason.",
+                statusCode: 500
+            );
+        }
+
+
+        return Results.NoContent(); //204 on success
 
     }
     catch (Exception ex)
@@ -280,10 +306,58 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
 public class SyncService
 {
     private readonly ApplicationDbContext _dbContext;
+    private readonly PlaidClient _plaidClient;
 
-    public SyncService(ApplicationDbContext dbContext)
+    public SyncService(ApplicationDbContext dbContext, [FromServices] PlaidClient plaidClient)
     {
         _dbContext = dbContext;
+        _plaidClient = plaidClient;
+    }
+
+    public async Task<bool> SyncAllAsync(string userId)
+    {
+        try
+        {
+            var accountsResponse = await GetAccountsAsync(userId);
+            await SyncAccountsAsync(userId, accountsResponse);
+            return true;
+        }
+        catch (Exception ex) {
+            return false;
+        }
+    }
+
+    public async Task<AccountsGetResponse?> GetAccountsAsync(string userId)
+    {
+        
+        try
+        {
+            User localUser = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserId == userId);
+            var plaidResponse = await _plaidClient.AccountsGetAsync(
+                 new Going.Plaid.Accounts.AccountsGetRequest()
+                 {
+                     AccessToken = localUser.PlaidAccessToken
+                 }
+            );
+
+
+
+            if (plaidResponse.Error is not null)
+            {
+                Console.WriteLine($"[API] Error getting accounts: {plaidResponse.Error.ErrorMessage}");
+                throw new Exception(plaidResponse.Error.ErrorMessage);
+            }
+
+
+            return plaidResponse;
+
+        }
+        catch (Exception ex)
+        {
+            // Handle error
+            Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+            return null;
+        }
     }
 
     public async Task<string> SyncAccountsAsync(string userId, AccountsGetResponse plaidData)
@@ -301,25 +375,22 @@ public class SyncService
             return "Error: User not found.";
         }
 
-        // 2. Get all Plaid account IDs from the API response
+        // Get all Plaid account IDs from the API response
         var plaidAccountIdsFromApi = plaidData.Accounts
             .Select(a => a.AccountId)
             .ToHashSet();
 
-        // 3. Get all existing accounts from our database for this user
+        // Get all existing accounts from our database for this user
         var existingDbAccounts = await _dbContext.Accounts
             .Where(a => a.UserId == userId)
             .ToListAsync();
 
-        // 4. Create a lookup map for fast access
+        // Create a lookup map for fast access
         var dbAccountMap = existingDbAccounts.ToDictionary(a => a.PlaidAccountId);
 
         int addedCount = 0;
         int updatedCount = 0;
-
-        // 5. Loop through all accounts from the Plaid response
-        // This handles (U)pdates and (C)reates
-        // We are now looping over Going.Plaid.Entity.Account objects
+        
         foreach (var plaidAccount in plaidData.Accounts)
         {
             if (dbAccountMap.TryGetValue(plaidAccount.AccountId, out var dbAccount))
@@ -352,9 +423,7 @@ public class SyncService
                 addedCount++;
             }
         }
-
-        // 6. Handle deletes
-        // Find any accounts in our DB that are *no longer* in the Plaid response
+        // --- DELETE ---
         var accountsToDelete = existingDbAccounts
             .Where(a => !plaidAccountIdsFromApi.Contains(a.PlaidAccountId))
             .ToList();
@@ -364,12 +433,10 @@ public class SyncService
             _dbContext.Accounts.RemoveRange(accountsToDelete);
         deletedCount = accountsToDelete.Count;
 
-        // --- NEW: 7. Update the user's last sync time ---
         // We use UtcNow for server-side timestamps to avoid timezone issues.
         user.LastSyncTime = DateTime.UtcNow;
         _dbContext.Users.Update(user);
 
-        // 8. Save all changes to the database
         await _dbContext.SaveChangesAsync();
 
         return $"Sync complete. Added: {addedCount}, Updated: {updatedCount}, Removed: {deletedCount}.";
