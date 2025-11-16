@@ -2,6 +2,7 @@
 using FirebaseAdmin;
 using FirebaseAdmin.Auth;
 using Going.Plaid;
+using Going.Plaid.Accounts;
 using Going.Plaid.Entity;
 using Going.Plaid.Item;
 using Google.Apis.Auth.OAuth2;
@@ -16,6 +17,7 @@ using System.Globalization;
 using System.Net.Http;
 using System.Security.Cryptography;
 using static Google.Apis.Requests.BatchRequest;
+using static SSS_Backend.DatabaseDTOs;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -40,6 +42,7 @@ builder.Services.Configure<PlaidCredentials>(builder.Configuration.GetSection(Pl
 builder.Services.Configure<PlaidOptions>(builder.Configuration.GetSection(PlaidOptions.SectionKey));
 builder.Services.AddSingleton<PlaidClient>();
 builder.Services.AddSingleton<ContextContainer>(new ContextContainer() { RunningOnServer = true });
+builder.Services.AddScoped<SyncService>();
 
 var app = builder.Build();
 
@@ -99,6 +102,49 @@ app.MapPost("/api/exchange_public_token", async (
 app.MapGet("/api/accounts", async (
     HttpContext httpContext,
     ApplicationDbContext db,
+    SyncService syncService,
+    [FromServices] PlaidClient plaidClient) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    try
+    {
+        var accounts = await db.Accounts
+                .Where(a => a.UserId == userId)
+                .Select(a => new AccountDto
+                {
+                    AccountId = a.AccountId,
+                    AccountType = a.AccountType,
+                    AccountName = a.AccountName,
+                    CurrentBalance = a.CurrentBalance,
+                    PlaidMask = a.PlaidMask
+                })
+                .ToListAsync();
+
+        if (accounts is not null)
+        {
+            return Results.BadRequest("No accounts given user");
+        }
+
+
+        return Results.Ok(new { accounts });
+
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting the accounts.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+app.MapGet("/api/sync", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    SyncService syncService,
     [FromServices] PlaidClient plaidClient) =>
 {
     var userId = httpContext.Items["UserId"] as string;
@@ -106,21 +152,19 @@ app.MapGet("/api/accounts", async (
     .FirstOrDefaultAsync(u => u.UserId == userId);
     try
     {
-        var response = await plaidClient.AccountsGetAsync(
-             new Going.Plaid.Accounts.AccountsGetRequest()
-             {
-                 AccessToken = localUser.PlaidAccessToken
-             }
-              );
-
-
-        if (response.Error is not null)
+        var success = await syncService.SyncAllAsync(userId);
+        if (!success)
         {
-            return Results.BadRequest(response.Error);
+            Console.WriteLine($"[API] Error syncing user data.");
+            return Results.Problem(
+                title: "An error occurred while getting the accounts.",
+                detail: "Unknown reason.",
+                statusCode: 500
+            );
         }
 
 
-        return Results.Ok(new { response.Accounts });
+        return Results.NoContent(); //204 on success
 
     }
     catch (Exception ex)
@@ -176,7 +220,7 @@ app.MapPost("/api/create_link_token", async (
             {
                 AccessToken = null,
                 User = new LinkTokenCreateRequestUser { ClientUserId = userId, },
-                ClientName = "Quickstart for .NET",
+                ClientName = "Quickstart for .NET", //TODO
                 Products = products,
                 Language = Language.English,
                 CountryCodes = countryCodes,
@@ -197,6 +241,8 @@ app.MapPost("/api/create_link_token", async (
 
 })
 .AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+
 
 
 app.Run();
@@ -256,3 +302,145 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
         return await next(context);
     }
 }
+
+public class SyncService
+{
+    private readonly ApplicationDbContext _dbContext;
+    private readonly PlaidClient _plaidClient;
+
+    public SyncService(ApplicationDbContext dbContext, [FromServices] PlaidClient plaidClient)
+    {
+        _dbContext = dbContext;
+        _plaidClient = plaidClient;
+    }
+
+    public async Task<bool> SyncAllAsync(string userId)
+    {
+        try
+        {
+            var accountsResponse = await GetAccountsAsync(userId);
+            await SyncAccountsAsync(userId, accountsResponse);
+            return true;
+        }
+        catch (Exception ex) {
+            return false;
+        }
+    }
+
+    public async Task<AccountsGetResponse?> GetAccountsAsync(string userId)
+    {
+        
+        try
+        {
+            User localUser = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserId == userId);
+            var plaidResponse = await _plaidClient.AccountsGetAsync(
+                 new Going.Plaid.Accounts.AccountsGetRequest()
+                 {
+                     AccessToken = localUser.PlaidAccessToken
+                 }
+            );
+
+
+
+            if (plaidResponse.Error is not null)
+            {
+                Console.WriteLine($"[API] Error getting accounts: {plaidResponse.Error.ErrorMessage}");
+                throw new Exception(plaidResponse.Error.ErrorMessage);
+            }
+
+
+            return plaidResponse;
+
+        }
+        catch (Exception ex)
+        {
+            // Handle error
+            Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+            return null;
+        }
+    }
+
+    public async Task<string> SyncAccountsAsync(string userId, AccountsGetResponse plaidData)
+    {
+        // 1. Validate the Plaid response
+        if (plaidData == null || plaidData.Accounts == null)
+        {
+            return "Error: Invalid Plaid response data.";
+        }
+
+        var user = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserId == userId);
+        if (user == null)
+        {
+            // This shouldn't happen if the userId is valid, but it's a good safety check.
+            return "Error: User not found.";
+        }
+
+        // Get all Plaid account IDs from the API response
+        var plaidAccountIdsFromApi = plaidData.Accounts
+            .Select(a => a.AccountId)
+            .ToHashSet();
+
+        // Get all existing accounts from our database for this user
+        var existingDbAccounts = await _dbContext.Accounts
+            .Where(a => a.UserId == userId)
+            .ToListAsync();
+
+        // Create a lookup map for fast access
+        var dbAccountMap = existingDbAccounts.ToDictionary(a => a.PlaidAccountId);
+
+        int addedCount = 0;
+        int updatedCount = 0;
+        
+        foreach (var plaidAccount in plaidData.Accounts)
+        {
+            if (dbAccountMap.TryGetValue(plaidAccount.AccountId, out var dbAccount))
+            {
+                // --- UPDATE ---
+                dbAccount.CurrentBalance = plaidAccount.Balances.Current ?? 0;
+                dbAccount.AccountName = plaidAccount.Name;
+                dbAccount.OfficialName = plaidAccount.OfficialName;
+                dbAccount.AccountType = plaidAccount.Type.ToString();
+                dbAccount.PlaidMask = plaidAccount.Mask;
+
+                _dbContext.Accounts.Update(dbAccount);
+                updatedCount++;
+            }
+            else
+            {
+                // --- CREATE ---
+                var newAccount = new Account
+                {
+                    PlaidAccountId = plaidAccount.AccountId,
+                    UserId = userId,
+                    CurrentBalance = plaidAccount.Balances.Current ?? 0,
+                    AccountName = plaidAccount.Name,
+                    OfficialName = plaidAccount.OfficialName,
+                    AccountType = plaidAccount.Type.ToString(),
+                    PlaidMask = plaidAccount.Mask
+                };
+
+                await _dbContext.Accounts.AddAsync(newAccount);
+                addedCount++;
+            }
+        }
+        // --- DELETE ---
+        var accountsToDelete = existingDbAccounts
+            .Where(a => !plaidAccountIdsFromApi.Contains(a.PlaidAccountId))
+            .ToList();
+
+        int deletedCount = 0;
+        if (accountsToDelete.Any())
+            _dbContext.Accounts.RemoveRange(accountsToDelete);
+        deletedCount = accountsToDelete.Count;
+
+        // We use UtcNow for server-side timestamps to avoid timezone issues.
+        user.LastSyncTime = DateTime.UtcNow;
+        _dbContext.Users.Update(user);
+
+        await _dbContext.SaveChangesAsync();
+
+        return $"Sync complete. Added: {addedCount}, Updated: {updatedCount}, Removed: {deletedCount}.";
+    }
+}
+
+
