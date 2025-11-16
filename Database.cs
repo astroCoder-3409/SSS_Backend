@@ -46,6 +46,9 @@ public class User
     public DateTime? DateOfBirth { get; set; }
 
     public DateTime? LastSyncTime { get; set; }
+    
+    public string? PlaidTransactionsCursor { get; set; }
+
 
     // Plaid access token - nullable since not all users may have connected Plaid
     [MaxLength(500)]
@@ -98,6 +101,17 @@ public class Transaction
 {
     [Key]
     public int TransactionId { get; set; }
+
+    public string? PlaidTransactionId { get; set; }
+
+    public string? PlaidCategoryPrimary { get; set; }
+
+    public string? PlaidCategoryDetailed { get; set; }
+
+    public string? PlaidCategoryConfidenceLevel { get; set; }
+
+    public bool? IsPending { get; set; }
+
 
     [Required]
     [Column(TypeName = "decimal(18, 2)")]

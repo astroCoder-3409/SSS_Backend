@@ -5,6 +5,7 @@ using Going.Plaid;
 using Going.Plaid.Accounts;
 using Going.Plaid.Entity;
 using Going.Plaid.Item;
+using Going.Plaid.Transactions;
 using Google.Apis.Auth.OAuth2;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -120,7 +121,7 @@ app.MapGet("/api/accounts", async (
                 })
                 .ToListAsync();
 
-        if (accounts is not null)
+        if (accounts is null)
         {
             return Results.BadRequest("No accounts given user");
         }
@@ -140,6 +141,55 @@ app.MapGet("/api/accounts", async (
         );
     }
 }).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+app.MapGet("/api/transactions", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    SyncService syncService,
+    [FromServices] PlaidClient plaidClient) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    try
+    {
+        var transactions = await db.Transactions
+            .Where(t => t.Account.UserId == userId) // Filter by UserId on the related Account
+            .Include(t => t.Category) // Eagerly load the Category
+            .Select(t => new TransactionDto
+            {
+                TransactionId = t.TransactionId,
+                PlaidTransactionId = t.PlaidTransactionId,
+                Amount = t.Amount,
+                TransactionDate = t.TransactionDate,
+                MerchantName = t.MerchantName,
+                Description = t.Description,
+                IsPending = t.IsPending,
+                PlaidCategoryPrimary = t.PlaidCategoryPrimary,
+                PlaidCategoryDetailed = t.PlaidCategoryDetailed,
+                PlaidCategoryConfidenceLevel = t.PlaidCategoryConfidenceLevel
+            })
+            .ToListAsync();
+
+        if (transactions is null)
+        {
+            return Results.BadRequest("No transactions for given user");
+        }
+
+
+        return Results.Ok(new { transactions });
+
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting the accounts.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
 
 app.MapGet("/api/sync", async (
     HttpContext httpContext,
@@ -320,6 +370,8 @@ public class SyncService
         {
             var accountsResponse = await GetAccountsAsync(userId);
             await SyncAccountsAsync(userId, accountsResponse);
+            var transactionsResponse = await GetTransactionsAsync(userId);
+            await SyncTransactionsAsync(userId, transactionsResponse);
             return true;
         }
         catch (Exception ex) {
@@ -440,6 +492,133 @@ public class SyncService
         await _dbContext.SaveChangesAsync();
 
         return $"Sync complete. Added: {addedCount}, Updated: {updatedCount}, Removed: {deletedCount}.";
+    }
+
+    public async Task<TransactionsSyncResponse?> GetTransactionsAsync(string userId)
+    {
+
+        try
+        {
+            User localUser = await _dbContext.Users.FirstOrDefaultAsync(u => u.UserId == userId);
+            var plaidResponse = await _plaidClient.TransactionsSyncAsync(
+                 new Going.Plaid.Transactions.TransactionsSyncRequest()
+                 {
+                     AccessToken = localUser.PlaidAccessToken,
+                     Cursor = localUser.PlaidTransactionsCursor,
+                 }
+            );
+
+
+
+            if (plaidResponse.Error is not null)
+            {
+                Console.WriteLine($"[API] Error getting transactions: {plaidResponse.Error.ErrorMessage}");
+                throw new Exception(plaidResponse.Error.ErrorMessage);
+            }
+
+
+            return plaidResponse;
+
+        }
+        catch (Exception ex)
+        {
+            // Handle error
+            Console.WriteLine($"[API] Error getting transactions: {ex.Message}");
+            return null;
+        }
+    }
+
+    public async Task<string> SyncTransactionsAsync(string userId, TransactionsSyncResponse plaidData)
+    {
+        if (plaidData == null)
+            return "Error: No Plaid data received.";
+
+        // --- 1. Get this user's DB Accounts ---
+        // We need a map of [PlaidAccountId (string)] -> [Internal AccountId (int)]
+        // to correctly link transactions.
+        var userAccounts = await _dbContext.Accounts
+            .Where(a => a.UserId == userId)
+            .ToListAsync();
+
+        var accountIdMap = userAccounts.ToDictionary(a => a.PlaidAccountId, a => a.AccountId);
+        var accountEntityMap = userAccounts.ToDictionary(a => a.PlaidAccountId);
+
+        int addedCount = 0, modifiedCount = 0, removedCount = 0;
+
+        // --- 3. Add new transactions (from the 'added' array) ---
+        foreach (var plaidTx in plaidData.Added)
+        {
+            // Find our internal AccountId
+            if (accountIdMap.TryGetValue(plaidTx.AccountId, out int internalAccountId))
+            {
+                var newTransaction = new Transaction();
+                MapPlaidTransactionToEntity(plaidTx, newTransaction, internalAccountId);
+                await _dbContext.Transactions.AddAsync(newTransaction);
+                addedCount++;
+            }
+            // You could add an 'else' here to log an unmapped transaction
+        }
+
+        // --- 4. Modify existing transactions (from the 'modified' array) ---
+        foreach (var plaidTx in plaidData.Modified)
+        {
+            var existingTx = await _dbContext.Transactions
+                .FirstOrDefaultAsync(t => t.PlaidTransactionId == plaidTx.TransactionId);
+
+            if (existingTx != null)
+            {
+                // Find our internal AccountId (in case it changed, though unlikely)
+                if (accountIdMap.TryGetValue(plaidTx.AccountId, out int internalAccountId))
+                {
+                    MapPlaidTransactionToEntity(plaidTx, existingTx, internalAccountId);
+                    _dbContext.Transactions.Update(existingTx);
+                    modifiedCount++;
+                }
+            }
+        }
+
+        // --- 5. Remove old transactions (from the 'removed' array) ---
+        foreach (var removedTx in plaidData.Removed)
+        {
+            var txToDelete = await _dbContext.Transactions
+                .FirstOrDefaultAsync(t => t.PlaidTransactionId == removedTx.TransactionId);
+
+            if (txToDelete != null)
+            {
+                _dbContext.Transactions.Remove(txToDelete);
+                removedCount++;
+            }
+        }
+
+        // --- 6. Update the User's Cursor ---
+        // This is the MOST important step for the *next* sync.
+        var user = await _dbContext.Users.FindAsync(userId);
+        if (user != null)
+        {
+            user.PlaidTransactionsCursor = plaidData.NextCursor;
+            _dbContext.Users.Update(user);
+        }
+
+        // --- 7. Save all changes in one transaction ---
+        await _dbContext.SaveChangesAsync();
+
+        return $"Transaction sync complete. Added: {addedCount}, Modified: {modifiedCount}, Removed: {removedCount}.";
+    }
+
+    private void MapPlaidTransactionToEntity(Going.Plaid.Entity.Transaction plaidTx, Transaction dbTx, int internalAccountId)
+    {
+        dbTx.PlaidTransactionId = plaidTx.TransactionId;
+        dbTx.AccountId = internalAccountId;
+        dbTx.Amount = plaidTx.Amount ?? 0;
+        dbTx.TransactionDate = plaidTx.Date?.ToDateTime(TimeOnly.MinValue) ?? new DateTime();
+        dbTx.Description = plaidTx.Name;
+        dbTx.MerchantName = plaidTx.MerchantName ?? plaidTx.Counterparties?.FirstOrDefault()?.Name ?? "no name?"; //TODO: why are there no names sometimes... should this be optional?
+        dbTx.IsPending = plaidTx.Pending;
+        dbTx.PlaidCategoryPrimary = plaidTx.PersonalFinanceCategory.Primary;
+        dbTx.PlaidCategoryDetailed = plaidTx.PersonalFinanceCategory.Detailed;
+        dbTx.PlaidCategoryConfidenceLevel = plaidTx.PersonalFinanceCategory.ConfidenceLevel;
+        // We will leave this null for now.
+        dbTx.CategoryId = null;
     }
 }
 
