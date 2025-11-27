@@ -607,16 +607,6 @@ public class SyncService
         if (plaidData == null)
             return "Error: No Plaid data received.";
 
-        var transactionDates = new HashSet<DateOnly>();
-
-        // Helper to process the date safely
-        void ProcessTransactionDate(DateOnly? date)
-        {
-            if (date.HasValue)
-            {
-                transactionDates.Add(new DateOnly(date.Value.Year, date.Value.Month, 1));
-            }
-        }
 
         // We need a map of [PlaidAccountId (string)] -> [Internal AccountId (int)]
         // to correctly link transactions.
@@ -639,7 +629,6 @@ public class SyncService
                 await _dbContext.Transactions.AddAsync(newTransaction);
                 addedCount++;
             }
-            ProcessTransactionDate(plaidTx.Date);
         }
 
         foreach (var plaidTx in plaidData.Modified)
@@ -656,7 +645,6 @@ public class SyncService
                     _dbContext.Transactions.Update(existingTx);
                     modifiedCount++;
                 }
-                ProcessTransactionDate(plaidTx.Date);
             }
         }
 
