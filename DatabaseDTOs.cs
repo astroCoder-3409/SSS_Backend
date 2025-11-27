@@ -28,5 +28,15 @@ namespace SSS_Backend
             public string MerchantName { get; set; }
             public string? Description { get; set; }
         }
+
+        public class UserDto
+        {
+            public string Email { get; set; }
+            public string? FullName { get; set; }
+            public DateTime? DateOfBirth { get; set; }
+            public DateTime? LastSyncTime { get; set; }
+            public List<string>? TransactionMonths { get; set; }
+
+        }
     }
 }

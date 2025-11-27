@@ -142,17 +142,32 @@ app.MapGet("/api/accounts", async (
     }
 }).AddEndpointFilter<FirebaseAuthorizeFilter>();
 
-app.MapGet("/api/transactions", async (
+app.MapPost("/api/transactions", async (
     HttpContext httpContext,
     ApplicationDbContext db,
+    [FromBody] MonthRequest request,
     SyncService syncService,
     [FromServices] PlaidClient plaidClient) =>
 {
     var userId = httpContext.Items["UserId"] as string;
+    DateTime startOfMonth = default;
+    if (request?.MonthYear != null && !DateTime.TryParseExact(
+        request.MonthYear,
+        "MM/yyyy",
+        System.Globalization.CultureInfo.InvariantCulture, // Use InvariantCulture for consistent parsing
+        System.Globalization.DateTimeStyles.None,
+        out startOfMonth))
+    {
+        return Results.BadRequest("Invalid month format. Please use the **MM/YYYY** format. Or, pass in null to get complete transaction history.");
+    }
+
+    var endOfMonthExclusive = startOfMonth.AddMonths(1);
+
     try
     {
         var transactions = await db.Transactions
             .Where(t => t.Account.UserId == userId) // Filter by UserId on the related Account
+            .Where(t => request.MonthYear != null ? (t.TransactionDate >= startOfMonth.Date && t.TransactionDate < endOfMonthExclusive.Date) : true)
             .Include(t => t.Category) // Eagerly load the Category
             .Select(t => new TransactionDto
             {
@@ -175,7 +190,7 @@ app.MapGet("/api/transactions", async (
         }
 
 
-        return Results.Ok(new { transactions });
+        return Results.Ok(new { transactionCount = transactions.Count(), transactions =  transactions });
 
     }
     catch (Exception ex)
@@ -184,6 +199,65 @@ app.MapGet("/api/transactions", async (
         Console.WriteLine($"[API] Error getting accounts: {ex.Message}");
         return Results.Problem(
             title: "An error occurred while getting the accounts.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+}).AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+app.MapGet("/api/user", async (
+    HttpContext httpContext,
+    ApplicationDbContext db,
+    SyncService syncService,
+    [FromServices] PlaidClient plaidClient) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+    try
+    {
+        var userDetails = await db.Users
+            .Where(u => u.UserId == userId) 
+            .Select(u => new
+            {
+                Email = u.Email,
+                FullName = u.FullName,
+                DateOfBirth = u.DateOfBirth,
+                LastSyncTime = u.LastSyncTime,
+                RawTransactionMonths = u.TransactionMonths,
+            }
+            )
+            .FirstOrDefaultAsync();
+
+        if (userDetails != null)
+        {
+            var userDto = new UserDto
+            {
+                Email = userDetails.Email,
+                FullName = userDetails.FullName,
+                DateOfBirth = userDetails.DateOfBirth,
+                LastSyncTime = userDetails.LastSyncTime,
+                // The formatting logic is now safe to run client-side
+                TransactionMonths = userDetails.RawTransactionMonths
+                    .Select(t => t.ToString("MM/yyyy"))
+                    .ToList(),
+            };
+            return Results.Ok(new { userDto });
+        }
+
+        else 
+        {
+            return Results.BadRequest("Unable to return a user.");
+        }
+
+
+        
+
+    }
+    catch (Exception ex)
+    {
+        // Handle error
+        Console.WriteLine($"[API] Error getting user: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting the user.",
             detail: ex.Message,
             statusCode: 500
         );
@@ -533,7 +607,17 @@ public class SyncService
         if (plaidData == null)
             return "Error: No Plaid data received.";
 
-        // --- 1. Get this user's DB Accounts ---
+        var transactionDates = new HashSet<DateOnly>();
+
+        // Helper to process the date safely
+        void ProcessTransactionDate(DateOnly? date)
+        {
+            if (date.HasValue)
+            {
+                transactionDates.Add(new DateOnly(date.Value.Year, date.Value.Month, 1));
+            }
+        }
+
         // We need a map of [PlaidAccountId (string)] -> [Internal AccountId (int)]
         // to correctly link transactions.
         var userAccounts = await _dbContext.Accounts
@@ -545,7 +629,6 @@ public class SyncService
 
         int addedCount = 0, modifiedCount = 0, removedCount = 0;
 
-        // --- 3. Add new transactions (from the 'added' array) ---
         foreach (var plaidTx in plaidData.Added)
         {
             // Find our internal AccountId
@@ -556,10 +639,9 @@ public class SyncService
                 await _dbContext.Transactions.AddAsync(newTransaction);
                 addedCount++;
             }
-            // You could add an 'else' here to log an unmapped transaction
+            ProcessTransactionDate(plaidTx.Date);
         }
 
-        // --- 4. Modify existing transactions (from the 'modified' array) ---
         foreach (var plaidTx in plaidData.Modified)
         {
             var existingTx = await _dbContext.Transactions
@@ -574,10 +656,10 @@ public class SyncService
                     _dbContext.Transactions.Update(existingTx);
                     modifiedCount++;
                 }
+                ProcessTransactionDate(plaidTx.Date);
             }
         }
 
-        // --- 5. Remove old transactions (from the 'removed' array) ---
         foreach (var removedTx in plaidData.Removed)
         {
             var txToDelete = await _dbContext.Transactions
@@ -590,16 +672,29 @@ public class SyncService
             }
         }
 
-        // --- 6. Update the User's Cursor ---
-        // This is the MOST important step for the *next* sync.
+
+        var existingDates = await _dbContext.Transactions
+            .Where(t => userAccounts.Select(a => a.AccountId).Contains(t.AccountId))
+            .Select(t => t.TransactionDate)
+            .ToListAsync();
+
+        var allUniqueMonths = existingDates
+            .Select(d => new DateOnly(d.Year, d.Month, 1)) // Normalize to the 1st of the month
+            .Distinct()
+            .OrderByDescending(d => d.Year) // Sort by year
+            .ThenByDescending(d => d.Month) // Then by month
+            .ToList();
+
         var user = await _dbContext.Users.FindAsync(userId);
+
         if (user != null)
         {
+            // This is the MOST important step for the *next* sync.
             user.PlaidTransactionsCursor = plaidData.NextCursor;
+            user.TransactionMonths = allUniqueMonths;
             _dbContext.Users.Update(user);
         }
 
-        // --- 7. Save all changes in one transaction ---
         await _dbContext.SaveChangesAsync();
 
         return $"Transaction sync complete. Added: {addedCount}, Modified: {modifiedCount}, Removed: {removedCount}.";
