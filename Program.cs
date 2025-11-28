@@ -240,7 +240,7 @@ app.MapGet("/api/user", async (
                     .Select(t => t.ToString("MM/yyyy"))
                     .ToList(),
             };
-            return Results.Ok(new { userDto });
+            return Results.Ok(userDto);
         }
 
         else 
