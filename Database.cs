@@ -49,6 +49,8 @@ public class User
     
     public string? PlaidTransactionsCursor { get; set; }
 
+    public List<DateOnly>? TransactionMonths { get; set; }
+
 
     // Plaid access token - nullable since not all users may have connected Plaid
     [MaxLength(500)]
