@@ -81,6 +81,7 @@ app.MapPost("/api/exchange_public_token", async (
 
         localUser.PlaidAccessToken = response.AccessToken;
         localUser.PlaidItemId = response.ItemId;
+        localUser.PlaidTransactionsCursor = null;
 
         db.Users.Update(localUser);
         await db.SaveChangesAsync();
