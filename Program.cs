@@ -17,6 +17,7 @@ using System;
 using System.Globalization;
 using System.Net.Http;
 using System.Security.Cryptography;
+using System.Text.Json;
 using static Google.Apis.Requests.BatchRequest;
 using static SSS_Backend.DatabaseDTOs;
 
@@ -39,11 +40,20 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
     options.UseSqlite(connectionString));
 
 builder.Services.AddHttpClient();
+
+// Configure HttpClient for LLM API
+builder.Services.AddHttpClient("LLMApiClient", client =>
+{
+    client.BaseAddress = new Uri("http://127.0.0.1:8000");
+    client.Timeout = TimeSpan.FromSeconds(60); // LLM might take a while to respond
+});
+
 builder.Services.Configure<PlaidCredentials>(builder.Configuration.GetSection(PlaidOptions.SectionKey));
 builder.Services.Configure<PlaidOptions>(builder.Configuration.GetSection(PlaidOptions.SectionKey));
 builder.Services.AddSingleton<PlaidClient>();
 builder.Services.AddSingleton<ContextContainer>(new ContextContainer() { RunningOnServer = true });
 builder.Services.AddScoped<SyncService>();
+builder.Services.AddScoped<SSS_Backend.LLMService>();
 
 var app = builder.Build();
 
@@ -304,6 +314,236 @@ app.MapGet("/api/sync", async (
 }).AddEndpointFilter<FirebaseAuthorizeFilter>();
 
 
+// LLM Query endpoint - sends user query with database context to LLM service
+app.MapPost("/api/llm/query", async (
+    HttpContext httpContext,
+    [FromBody] LLMQueryRequest request,
+    [FromServices] SSS_Backend.LLMService llmService) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+
+    try
+    {
+        if (string.IsNullOrWhiteSpace(request.Query))
+        {
+            return Results.BadRequest(new { error = "Query cannot be empty" });
+        }
+
+        // Get financial advice from LLM with user's monthly spending data
+        string response = await llmService.GetFinancialAdvice(
+            request.Query, 
+            userId, 
+            request.Month,
+            request.Year
+        );
+
+        return Results.Ok(new { response });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[API] Error processing LLM query: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while processing your query.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+})
+.AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+// Get spending data endpoint - returns aggregated spending without LLM query
+app.MapGet("/api/llm/spending-data", async (
+    HttpContext httpContext,
+    [FromServices] SSS_Backend.LLMService llmService,
+    [FromQuery] int? month,
+    [FromQuery] int? year) =>
+{
+    var userId = httpContext.Items["UserId"] as string;
+
+    try
+    {
+        var spendingData = await llmService.GetSpendingData(userId, month, year);
+        return Results.Ok(spendingData);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[API] Error getting spending data: {ex.Message}");
+        return Results.Problem(
+            title: "An error occurred while getting spending data.",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+})
+.AddEndpointFilter<FirebaseAuthorizeFilter>();
+
+// TEST ENDPOINT WITH DUMMY DATA - No database required!
+app.MapPost("/api/test/llm-dummy", async (
+    [FromBody] TestLLMRequest request,
+    [FromServices] IHttpClientFactory httpClientFactory) =>
+{
+    try
+    {
+        Console.WriteLine($"[TEST] Testing LLM with dummy data");
+        Console.WriteLine($"[TEST] Query: {request.Query ?? "How can I cut down on expenses and save more?"}");
+
+        // Create dummy spending data
+        var dummySpending = new List<SSS_Backend.CategorySpending>
+        {
+            new() { Category = "FOOD_AND_DRINK", Amount = 850.50m },
+            new() { Category = "TRANSPORTATION", Amount = 320.00m },
+            new() { Category = "GENERAL_MERCHANDISE", Amount = 275.99m },
+            new() { Category = "ENTERTAINMENT", Amount = 180.00m },
+            new() { Category = "GENERAL_SERVICES", Amount = 150.00m },
+            new() { Category = "HOME_IMPROVEMENT", Amount = 125.75m },
+            new() { Category = "RENT_AND_UTILITIES", Amount = 1200.00m }
+        };
+
+        var now = DateTime.UtcNow;
+        var targetMonth = request.Month ?? now.Month;
+        var targetYear = request.Year ?? now.Year;
+        var monthName = new DateTime(targetYear, targetMonth, 1).ToString("MMMM");
+
+        var spendingContext = new SSS_Backend.SpendingContext
+        {
+            Month = monthName,
+            Year = targetYear,
+            Spending = dummySpending
+        };
+
+        // Serialize to JSON string
+        var jsonOptions = new JsonSerializerOptions
+        {
+            WriteIndented = false
+        };
+        string dataContextJson = JsonSerializer.Serialize(spendingContext, jsonOptions);
+
+        // Prepare LLM request
+        var llmRequest = new SSS_Backend.LLMRequest
+        {
+            Query = request.Query ?? "How can I cut down on expenses and save more?",
+            DataContext = dataContextJson
+        };
+
+        Console.WriteLine($"[TEST] Sending to LLM server at http://127.0.0.1:8000/analyze");
+        Console.WriteLine($"[TEST] Data Context: {dataContextJson}");
+
+        // Call LLM API
+        var httpClient = httpClientFactory.CreateClient("LLMApiClient");
+        var response = await httpClient.PostAsJsonAsync("/analyze", llmRequest);
+        
+        if (!response.IsSuccessStatusCode)
+        {
+            var errorContent = await response.Content.ReadAsStringAsync();
+            return Results.Problem(
+                title: $"LLM Server returned {response.StatusCode}",
+                detail: errorContent,
+                statusCode: (int)response.StatusCode
+            );
+        }
+
+        var llmResponse = await response.Content.ReadFromJsonAsync<SSS_Backend.LLMResponse>();
+
+        return Results.Ok(new
+        {
+            test_mode = "dummy_data",
+            query = llmRequest.Query,
+            month = monthName,
+            year = targetYear,
+            spending_summary = dummySpending,
+            total_spending = dummySpending.Sum(s => s.Amount),
+            total_categories = dummySpending.Count,
+            llm_response = llmResponse?.Response ?? "No response received"
+        });
+    }
+    catch (HttpRequestException ex)
+    {
+        Console.WriteLine($"[TEST] HTTP Error: {ex.Message}");
+        return Results.Problem(
+            title: "Cannot connect to LLM server",
+            detail: $"Make sure your LLM server is running at http://127.0.0.1:8000. Error: {ex.Message}",
+            statusCode: 503
+        );
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[TEST] Error: {ex.Message}");
+        return Results.Problem(
+            title: "Test endpoint error",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+});
+
+// TEST ENDPOINT - Remove in production!
+app.MapPost("/api/test/llm", async (
+    [FromBody] TestLLMRequest request,
+    [FromServices] SSS_Backend.LLMService llmService,
+    ApplicationDbContext db) =>
+{
+    try
+    {
+        // Get the first user from the database for testing
+        var testUser = await db.Users.FirstOrDefaultAsync();
+        
+        if (testUser == null)
+        {
+            return Results.BadRequest(new { 
+                error = "No users found in database. Please sync some data first.",
+                hint = "Call /api/create_link_token and /api/exchange_public_token to add a user and sync transactions."
+            });
+        }
+
+        Console.WriteLine($"[TEST] Testing LLM with user: {testUser.Email}");
+        Console.WriteLine($"[TEST] Query: {request.Query}");
+        Console.WriteLine($"[TEST] Month: {request.Month}, Year: {request.Year}");
+
+        // First, let's check what data we have
+        var spendingData = await llmService.GetSpendingData(testUser.UserId, request.Month, request.Year);
+        
+        if (spendingData.Spending.Count == 0)
+        {
+            return Results.Ok(new { 
+                warning = "No transaction data found for this period.",
+                user = testUser.Email,
+                month = spendingData.Month,
+                year = spendingData.Year,
+                spending = spendingData.Spending,
+                llm_response = "No data available to analyze."
+            });
+        }
+
+        // Get financial advice from LLM
+        string llmResponse = await llmService.GetFinancialAdvice(
+            request.Query ?? "How can I cut down on expenses and save more?",
+            testUser.UserId,
+            request.Month,
+            request.Year
+        );
+
+        return Results.Ok(new { 
+            user = testUser.Email,
+            query = request.Query ?? "How can I cut down on expenses and save more?",
+            month = spendingData.Month,
+            year = spendingData.Year,
+            spending_summary = spendingData.Spending.Take(5), // Top 5 categories
+            total_categories = spendingData.Spending.Count,
+            total_spending = spendingData.Spending.Sum(s => s.Amount),
+            llm_response = llmResponse
+        });
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[TEST] Error: {ex.Message}");
+        return Results.Problem(
+            title: "Test endpoint error",
+            detail: ex.Message,
+            statusCode: 500
+        );
+    }
+});
+
 // Example of protected endpoint TODO Remove this later.
 app.MapGet("/api/protected-data", (HttpContext httpContext) => {
     var userId = httpContext.Items["UserId"] as string;
@@ -370,6 +610,22 @@ app.MapPost("/api/create_link_token", async (
 
 
 app.Run();
+
+// DTO for LLM query requests
+public class LLMQueryRequest
+{
+    public required string Query { get; set; }
+    public int? Month { get; set; } // Optional: 1-12, defaults to current month
+    public int? Year { get; set; }  // Optional: defaults to current year
+}
+
+// DTO for testing LLM (no auth required)
+public class TestLLMRequest
+{
+    public string? Query { get; set; } // Optional: defaults to a test query
+    public int? Month { get; set; }    // Optional: 1-12, defaults to current month
+    public int? Year { get; set; }     // Optional: defaults to current year
+}
 
 public class FirebaseAuthorizeFilter : IEndpointFilter
 {

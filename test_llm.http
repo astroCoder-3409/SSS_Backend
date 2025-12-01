@@ -1,0 +1,87 @@
+### Test LLM Endpoint - Make sure your backend AND LLM server are running first!
+### You can use this with VS Code REST Client extension or tools like Postman
+
+@baseUrl = http://localhost:5290
+
+### ========================================
+### DUMMY DATA TESTS (No Database Required)
+### ========================================
+
+### Test 1 (Dummy): Default query with dummy data
+POST {{baseUrl}}/api/test/llm-dummy
+Content-Type: application/json
+
+{
+  "query": "How can I cut down on expenses and save more?"
+}
+
+### Test 2 (Dummy): Custom query with dummy data
+POST {{baseUrl}}/api/test/llm-dummy
+Content-Type: application/json
+
+{
+  "query": "What are my biggest spending categories and how can I reduce them?"
+}
+
+### Test 3 (Dummy): Specific month with dummy data
+POST {{baseUrl}}/api/test/llm-dummy
+Content-Type: application/json
+
+{
+  "query": "Analyze my spending and give me advice",
+  "month": 1,
+  "year": 2024
+}
+
+### ========================================
+### REAL DATA TESTS (Requires Database)
+### ========================================
+
+### Test 1 (Real): Default query (current month)
+POST {{baseUrl}}/api/test/llm
+Content-Type: application/json
+
+{
+  "query": "How can I cut down on expenses and save more?"
+}
+
+### Test 2: Custom query with current month
+POST {{baseUrl}}/api/test/llm
+Content-Type: application/json
+
+{
+  "query": "What are my biggest spending categories and how can I reduce them?"
+}
+
+### Test 3: Query for specific month (January 2024)
+POST {{baseUrl}}/api/test/llm
+Content-Type: application/json
+
+{
+  "query": "How can I cut down on expenses and save more?",
+  "month": 1,
+  "year": 2024
+}
+
+### Test 4: Query for specific month (November 2024)
+POST {{baseUrl}}/api/test/llm
+Content-Type: application/json
+
+{
+  "query": "Analyze my spending patterns and give me personalized advice.",
+  "month": 11,
+  "year": 2024
+}
+
+### Test 5: Get raw spending data (without LLM query)
+GET {{baseUrl}}/api/llm/spending-data?month=11&year=2024
+Authorization: Bearer YOUR_FIREBASE_TOKEN_HERE
+
+### ========================================
+### NOTES
+### ========================================
+### - /api/test/llm-dummy: Uses hardcoded dummy data (NO database needed)
+### - /api/test/llm: Uses real data from first user in database (requires data)
+### - /api/llm/query: Production endpoint (requires Firebase authentication)
+### - /api/llm/spending-data: Get raw spending data (requires Firebase authentication)
+
