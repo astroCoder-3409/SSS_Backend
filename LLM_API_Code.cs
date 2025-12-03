@@ -112,8 +112,10 @@ public class LLMService
                     Category = g.Key,
                     Amount = g.Sum(t => t.Amount)
                 })
-                .OrderByDescending(c => c.Amount)
                 .ToListAsync();
+            
+            // Sort on client-side to avoid SQLite decimal ordering issues
+            spendingByCategory = spendingByCategory.OrderByDescending(c => c.Amount).ToList();
 
             // 3. === CREATE SPENDING CONTEXT WITH METADATA ===
             var spendingContext = new SpendingContext
@@ -203,8 +205,10 @@ public class LLMService
                 Category = g.Key,
                 Amount = g.Sum(t => t.Amount)
             })
-            .OrderByDescending(c => c.Amount)
             .ToListAsync();
+        
+        // Sort on client-side to avoid SQLite decimal ordering issues
+        spendingByCategory = spendingByCategory.OrderByDescending(c => c.Amount).ToList();
 
         return new SpendingContext
         {
