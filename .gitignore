@@ -1,0 +1,108 @@
+# ===========================================
+# Combined .gitignore
+# ===========================================
+
+# -------------------------------------------
+# Secrets, Environment & Configuration
+# -------------------------------------------
+# Environment variables
+.env
+.env.*
+*.env
+
+# Encryption and Keys
+secrets/
+*.pem
+*.key
+
+# Firebase Secrets
+firebase-service-account.json
+*-firebase-adminsdk-*.json
+
+# ASP.NET Core User Secrets and Config
+appsettings.Development.json
+*.secrets.json
+
+# -------------------------------------------
+# Build Artifacts & Output
+# -------------------------------------------
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Rr]elease/
+[Dd]ebug/
+
+# -------------------------------------------
+# Dependencies (NuGet)
+# -------------------------------------------
+*.nupkg
+*.snupkg
+**/packages/*
+# Allow the build folder in packages (required for some restore scenarios)
+!**/packages/build/
+packages/
+
+# -------------------------------------------
+# Databases & Data
+# -------------------------------------------
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Local Data folders
+data/
+
+# -------------------------------------------
+# IDE & Editor Files
+# -------------------------------------------
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Visual Studio Code
+.vscode/
+
+# JetBrains Rider / ReSharper
+.idea/
+*.sln.iml
+*.DotSettings
+*.DotSettings.user
+
+# -------------------------------------------
+# Logs & Testing
+# -------------------------------------------
+# Test Results
+TestResults/
+*.trx
+
+# Logs
+*.log
+*.log.*
+logs/
+
+# -------------------------------------------
+# OS & System Files
+# -------------------------------------------
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# -------------------------------------------
+# Miscellaneous
+# -------------------------------------------
+# Docker
+.docker/
+
+# Merge conflict files
+*.orig
