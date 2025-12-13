@@ -9,7 +9,7 @@ RUN dotnet restore
 
 # Copy everything else and build
 COPY . ./
-RUN dotnet publish -c Release -o out
+RUN dotnet publish SSS_Backend.csproj -c Release -o out
 
 # Use the official .NET runtime image for the final stage
 FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
