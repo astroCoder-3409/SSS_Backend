@@ -7,10 +7,12 @@ using Going.Plaid.Entity;
 using Going.Plaid.Item;
 using Going.Plaid.Transactions;
 using Google.Apis.Auth.OAuth2;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using SSS_Backend;
 using System;
@@ -44,7 +46,8 @@ builder.Services.AddHttpClient();
 // Configure HttpClient for LLM API
 builder.Services.AddHttpClient("LLMApiClient", client =>
 {
-    client.BaseAddress = new Uri("http://127.0.0.1:8000");
+    var llmUrl = builder.Configuration["LLM_API_URL"] ?? "http://127.0.0.1:8000";
+    client.BaseAddress = new Uri(llmUrl);
     client.Timeout = TimeSpan.FromSeconds(60); // LLM might take a while to respond
 });
 
@@ -57,13 +60,18 @@ builder.Services.AddScoped<SSS_Backend.LLMService>();
 
 var app = builder.Build();
 
-var serviceAccountPath = builder.Configuration["Firebase:ServiceAccountPath"]; //TODO define path as env var
-
-FirebaseApp.Create(new AppOptions()
+// Only initialize Firebase if not in test mode
+var env = builder.Environment;
+if (env.EnvironmentName != "Testing")
 {
-    Credential = GoogleCredential.FromFile(serviceAccountPath),
-    ProjectId = "soft-serve-software",
-});
+    var serviceAccountPath = builder.Configuration["Firebase:ServiceAccountPath"]; //TODO define path as env var
+
+    FirebaseApp.Create(new AppOptions()
+    {
+        Credential = GoogleCredential.FromFile(serviceAccountPath),
+        ProjectId = "soft-serve-software",
+    });
+}
 
 //Must go before endpoints
 app.UseCors();
@@ -565,20 +573,87 @@ app.MapPost("/api/create_link_token", async (
     try
     {
         var userId = httpContext.Items["UserId"] as string;
+        
+        if (string.IsNullOrEmpty(userId))
+        {
+            Console.WriteLine("[API] create_link_token: UserId is null or empty");
+            return Results.Unauthorized();
+        }
+
+        Console.WriteLine($"[API] create_link_token: Request from user {userId}");
 
         // Get the configured options
         var credentials = plaidCredentials.Value;
 
-        // Safely parse products and country codes from options
-        var productsList = credentials.Products?.Split(',') ?? Array.Empty<string>();
-        var products = productsList
-            .Select(p => Enum.Parse<Products>(p, true))
-            .ToArray();
+        if (credentials == null)
+        {
+            Console.WriteLine("[API] create_link_token: PlaidCredentials is null");
+            return Results.Problem(
+                title: "Plaid configuration error",
+                detail: "Plaid credentials are not configured",
+                statusCode: 500
+            );
+        }
 
-        var countryCodesList = credentials.CountryCodes?.Split(',') ?? Array.Empty<string>();
-        var countryCodes = countryCodesList
-            .Select(p => Enum.Parse<CountryCode>(p, true))
-            .ToArray();
+        // Validate required configuration
+        if (string.IsNullOrEmpty(credentials.Products))
+        {
+            Console.WriteLine("[API] create_link_token: Products configuration is missing");
+            return Results.Problem(
+                title: "Plaid configuration error",
+                detail: "Plaid Products configuration is missing",
+                statusCode: 500
+            );
+        }
+
+        if (string.IsNullOrEmpty(credentials.CountryCodes))
+        {
+            Console.WriteLine("[API] create_link_token: CountryCodes configuration is missing");
+            return Results.Problem(
+                title: "Plaid configuration error",
+                detail: "Plaid CountryCodes configuration is missing",
+                statusCode: 500
+            );
+        }
+
+        // Safely parse products and country codes from options
+        var productsList = credentials.Products.Split(',');
+        Products[] products;
+        try
+        {
+            products = productsList
+                .Select(p => Enum.Parse<Products>(p.Trim(), true))
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[API] create_link_token: Error parsing products: {ex.Message}");
+            return Results.Problem(
+                title: "Plaid configuration error",
+                detail: $"Invalid Products configuration: {ex.Message}",
+                statusCode: 500
+            );
+        }
+
+        var countryCodesList = credentials.CountryCodes.Split(',');
+        CountryCode[] countryCodes;
+        try
+        {
+            countryCodes = countryCodesList
+                .Select(p => Enum.Parse<CountryCode>(p.Trim(), true))
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[API] create_link_token: Error parsing country codes: {ex.Message}");
+            return Results.Problem(
+                title: "Plaid configuration error",
+                detail: $"Invalid CountryCodes configuration: {ex.Message}",
+                statusCode: 500
+            );
+        }
+
+        Console.WriteLine($"[API] create_link_token: Creating link token with products: {string.Join(", ", products)}, countries: {string.Join(", ", countryCodes)}");
 
         var response = await plaidClient.LinkTokenCreateAsync(
             new()
@@ -593,15 +668,38 @@ app.MapPost("/api/create_link_token", async (
 
         if (response.Error is not null)
         {
-            return Results.BadRequest(response.Error);
+            Console.WriteLine($"[API] create_link_token: Plaid API error - {response.Error.ErrorType}: {response.Error.ErrorMessage}");
+            return Results.BadRequest(new { 
+                error = response.Error.ErrorType,
+                message = response.Error.ErrorMessage,
+                code = response.Error.ErrorCode
+            });
         }
 
+        if (string.IsNullOrEmpty(response.LinkToken))
+        {
+            Console.WriteLine("[API] create_link_token: LinkToken is null or empty in response");
+            return Results.Problem(
+                title: "Plaid API error",
+                detail: "Link token was not returned from Plaid",
+                statusCode: 500
+            );
+        }
+
+        Console.WriteLine($"[API] create_link_token: Successfully created link token for user {userId}");
+        
+        // Return as string (frontend expects the token as a string)
         return Results.Ok(response.LinkToken);
     }
     catch (Exception ex)
     {
-        // Return a more structured error
-        return Results.Problem(ex.Message, statusCode: 500);
+        Console.WriteLine($"[API] create_link_token: Unexpected error - {ex.Message}");
+        Console.WriteLine($"[API] create_link_token: Stack trace - {ex.StackTrace}");
+        return Results.Problem(
+            title: "An error occurred while creating the link token",
+            detail: ex.Message,
+            statusCode: 500
+        );
     }
 
 })
@@ -635,18 +733,54 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
         var httpContext = context.HttpContext;
         string? authHeader = httpContext.Request.Headers["Authorization"];
         var db = httpContext.RequestServices.GetRequiredService<ApplicationDbContext>();
+        var endpointPath = httpContext.Request.Path;
 
-        if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Bearer "))
+        if (string.IsNullOrEmpty(authHeader))
         {
+            Console.WriteLine($"[Auth] {endpointPath}: Authorization header is missing");
             return Results.Unauthorized();
         }
+
+        if (!authHeader.StartsWith("Bearer "))
+        {
+            Console.WriteLine($"[Auth] {endpointPath}: Authorization header does not start with 'Bearer '");
+            return Results.Unauthorized();
+        }
+
         var idToken = authHeader.Substring("Bearer ".Length).Trim();
+        
+        if (string.IsNullOrEmpty(idToken))
+        {
+            Console.WriteLine($"[Auth] {endpointPath}: Token is empty after extracting from Authorization header");
+            return Results.Unauthorized();
+        }
+
         try
         {
-            FirebaseToken decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
-            httpContext.Items["UserId"] = decodedToken.Uid;
+            // Check if we're in test mode (environment variable or configuration)
+            var env = httpContext.RequestServices.GetService<IWebHostEnvironment>();
+            bool isTestMode = env?.EnvironmentName == "Testing" || 
+                             System.Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") == "Testing";
 
-            string uid = decodedToken.Uid;
+            string uid;
+            FirebaseToken? decodedToken = null;
+            
+            if (isTestMode && idToken == "test-firebase-token")
+            {
+                // Test mode: use test user ID
+                uid = "test-user-123";
+                Console.WriteLine($"[Auth] {endpointPath}: Test mode - using test user {uid}");
+            }
+            else
+            {
+                // Production mode: verify Firebase token
+                Console.WriteLine($"[Auth] {endpointPath}: Verifying Firebase token...");
+                decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+                uid = decodedToken.Uid;
+                Console.WriteLine($"[Auth] {endpointPath}: Token verified successfully for user {uid}");
+            }
+
+            httpContext.Items["UserId"] = uid;
 
             User localUser = await db.Users
                 .FirstOrDefaultAsync(u => u.UserId == uid);
@@ -654,29 +788,56 @@ public class FirebaseAuthorizeFilter : IEndpointFilter
             if (localUser == null)
             {
                 // User does not exist locally. Create them.
-                Console.WriteLine($"New user syncing. Firebase UID: {uid}");
-                localUser = new User
+                Console.WriteLine($"[Auth] New user syncing. Firebase UID: {uid}");
+                if (isTestMode && idToken == "test-firebase-token")
                 {
-                    UserId = uid,
-                    Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString(),
-                    FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString(),
-                };
+                    localUser = new User
+                    {
+                        UserId = uid,
+                        Email = $"test-{uid}@example.com",
+                        FullName = "Test User",
+                    };
+                }
+                else
+                {
+                    // If decodedToken is null, we need to get it (shouldn't happen in production)
+                    if (decodedToken == null)
+                    {
+                        decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+                    }
+                    localUser = new User
+                    {
+                        UserId = uid,
+                        Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString(),
+                        FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString(),
+                    };
+                }
                 db.Users.Add(localUser);
             }
             else
             {
                 // User exists. Update their info just in case it changed.
-                Console.WriteLine($"Existing user logging in. Firebase UID: {uid}");
-                localUser.Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString();
-                localUser.FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString();
+                Console.WriteLine($"[Auth] Existing user logging in. Firebase UID: {uid}");
+                if (!isTestMode || idToken != "test-firebase-token")
+                {
+                    // If decodedToken is null, we need to get it (shouldn't happen in production)
+                    if (decodedToken == null)
+                    {
+                        decodedToken = await FirebaseAuth.DefaultInstance.VerifyIdTokenAsync(idToken);
+                    }
+                    localUser.Email = decodedToken.Claims.GetValueOrDefault("email", "").ToString();
+                    localUser.FullName = decodedToken.Claims.GetValueOrDefault("name", "").ToString();
+                }
                 db.Users.Update(localUser);
             }
 
             await db.SaveChangesAsync();
+            Console.WriteLine($"[Auth] {endpointPath}: User data saved successfully");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Firebase token verification failed: {ex.Message}");
+            Console.WriteLine($"[Auth] {endpointPath}: Unexpected error during token verification - {ex.Message}");
+            Console.WriteLine($"[Auth] {endpointPath}: Stack trace - {ex.StackTrace}");
             return Results.Unauthorized();
         }
 
